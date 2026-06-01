@@ -621,3 +621,40 @@ char* db_get_allocation_json(int user_id) {
     append_str(&json, &cap, &len, "]");
     return json;
 }
+
+// -------- sessions --------
+int db_create_session(int user_id, const char *token) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "INSERT OR REPLACE INTO sessions(token, user_id) VALUES(?, ?);";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, token, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, user_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_get_user_id_from_session(const char *token, int *out_user_id) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT user_id FROM sessions WHERE token = ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, token, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        if (out_user_id) *out_user_id = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    sqlite3_finalize(stmt);
+    return -1;
+}
+
+int db_delete_session(const char *token) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "DELETE FROM sessions WHERE token = ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, token, -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return 0;
+}
