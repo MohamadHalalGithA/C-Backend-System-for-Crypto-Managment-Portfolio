@@ -29,6 +29,10 @@ const mockAllocation = [
   { name: "Forex", value: 10, color: "hsl(280, 100%, 60%)" },
 ];
 
+function isBEUnavailable(error: unknown) {
+  return error instanceof Error && error.message.includes("Backend unavailable");
+}
+
 export function useAssets() {
   return useQuery({
     queryKey: ['assets'],
@@ -36,8 +40,8 @@ export function useAssets() {
       try {
         return await api.getAssets();
       } catch (error) {
-        console.warn('Backend unavailable, using mock data:', error);
-        return mockAssets;
+        if (isBEUnavailable(error)) return mockAssets;
+        throw error;
       }
     },
     staleTime: 30000,
@@ -51,8 +55,8 @@ export function useTransactions() {
       try {
         return await api.getTransactions();
       } catch (error) {
-        console.warn('Backend unavailable, using mock data:', error);
-        return mockTransactions;
+        if (isBEUnavailable(error)) return mockTransactions;
+        throw error;
       }
     },
     staleTime: 30000,
@@ -66,8 +70,8 @@ export function useChartData() {
       try {
         return await api.getChartData();
       } catch (error) {
-        console.warn('Backend unavailable, using mock data:', error);
-        return mockChartData;
+        if (isBEUnavailable(error)) return mockChartData;
+        throw error;
       }
     },
     staleTime: 60000,
@@ -81,8 +85,8 @@ export function useAllocation() {
       try {
         return await api.getAllocation();
       } catch (error) {
-        console.warn('Backend unavailable, using mock data:', error);
-        return mockAllocation;
+        if (isBEUnavailable(error)) return mockAllocation;
+        throw error;
       }
     },
     staleTime: 60000,
