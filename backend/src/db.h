@@ -1,7 +1,7 @@
 #ifndef DB_H
 #define DB_H
 
-#include "sqlite3.h"
+#include <sqlite3.h>
 
 // Init/close
 int db_init(const char *db_path);
