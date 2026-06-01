@@ -16,6 +16,20 @@ interface TradeModalProps {
   assets: Asset[];
 }
 
+// Predefined market assets available to buy
+const MARKET_ASSETS = [
+  { symbol: "BTC",  name: "Bitcoin",       price: 67000,  category: "Crypto" },
+  { symbol: "ETH",  name: "Ethereum",      price: 3500,   category: "Crypto" },
+  { symbol: "SOL",  name: "Solana",        price: 185,    category: "Crypto" },
+  { symbol: "BNB",  name: "BNB",           price: 600,    category: "Crypto" },
+  { symbol: "DOGE", name: "Dogecoin",      price: 0.16,   category: "Crypto" },
+  { symbol: "ADA",  name: "Cardano",       price: 0.45,   category: "Crypto" },
+  { symbol: "XRP",  name: "XRP",           price: 0.52,   category: "Crypto" },
+  { symbol: "AAPL", name: "Apple Inc.",    price: 185,    category: "Stock"  },
+  { symbol: "TSLA", name: "Tesla",         price: 250,    category: "Stock"  },
+  { symbol: "GOLD", name: "Gold",          price: 2000,   category: "Commodity" },
+];
+
 export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps) {
   const [asset, setAsset] = useState("");
   const [amount, setAmount] = useState("");
@@ -26,15 +40,22 @@ export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps
 
   const isBuy = type === "buy";
 
-  const selectedAsset = useMemo(
+  // For sell: look up in the user's portfolio
+  const portfolioAsset = useMemo(
     () => assets.find((a) => a.symbol === asset),
     [assets, asset]
   );
 
-  // Price is ALWAYS taken from mock data (selectedAsset.current_price)
-  const priceNum = selectedAsset?.current_price ?? 0;
+  // For buy: look up in the market list (use portfolio price if already owned)
+  const marketAsset = useMemo(
+    () => MARKET_ASSETS.find((a) => a.symbol === asset),
+    [asset]
+  );
 
-  // Reset fields whenever the modal closes
+  const priceNum = isBuy
+    ? (portfolioAsset?.current_price ?? marketAsset?.price ?? 0)
+    : (portfolioAsset?.current_price ?? 0);
+
   useEffect(() => {
     if (!open) {
       setAsset("");
@@ -43,46 +64,35 @@ export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps
     }
   }, [open]);
 
-  const handleAssetChange = (symbol: string) => {
-    setAsset(symbol);
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     const amountNum = parseFloat(amount);
 
     if (!asset) {
-      toast({
-        title: "Select an asset",
-        description: "Please choose an asset before submitting.",
-        variant: "destructive",
-      });
+      toast({ title: "Select an asset", variant: "destructive" });
       return;
     }
 
-    if (!selectedAsset) {
-      toast({
-        title: "Invalid asset",
-        description: "That asset wasn't found in the portfolio list.",
-        variant: "destructive",
-      });
+    if (isBuy && !marketAsset) {
+      toast({ title: "Unknown asset", variant: "destructive" });
+      return;
+    }
+
+    if (!isBuy && !portfolioAsset) {
+      toast({ title: "Asset not in portfolio", variant: "destructive" });
       return;
     }
 
     if (isNaN(amountNum) || amountNum <= 0) {
-      toast({
-        title: "Invalid quantity",
-        description: "Quantity must be greater than 0.",
-        variant: "destructive",
-      });
+      toast({ title: "Quantity must be greater than 0", variant: "destructive" });
       return;
     }
 
-    if (type === "sell" && amountNum > selectedAsset.quantity) {
+    if (!isBuy && amountNum > (portfolioAsset?.quantity ?? 0)) {
       toast({
         title: "Insufficient quantity",
-        description: `You only have ${selectedAsset.quantity} ${asset}`,
+        description: `You only have ${portfolioAsset?.quantity} ${asset}`,
         variant: "destructive",
       });
       return;
@@ -94,7 +104,7 @@ export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps
         type,
         asset,
         amount: amountNum,
-        price: priceNum, // FIXED
+        price: priceNum,
         total: amountNum * priceNum,
         timestamp: new Date().toISOString(),
         status: "pending",
@@ -113,8 +123,8 @@ export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps
     }
   };
 
-  const showTotal = !!selectedAsset && amount && !isNaN(parseFloat(amount));
-  const totalValue = (parseFloat(amount || "0") * priceNum) || 0;
+  const showTotal = !!asset && amount && !isNaN(parseFloat(amount));
+  const totalValue = parseFloat(amount || "0") * priceNum;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -128,28 +138,32 @@ export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps
 
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
           <div className="space-y-2">
-            <Label htmlFor="asset">Asset</Label>
-            <Select value={asset} onValueChange={handleAssetChange}>
+            <Label>Asset</Label>
+            <Select value={asset} onValueChange={setAsset}>
               <SelectTrigger className="cyber-input">
                 <SelectValue placeholder="Select asset" />
               </SelectTrigger>
               <SelectContent>
-                {assets.map((a) => (
-                  <SelectItem key={a.id} value={a.symbol}>
-                    <span className="font-bold">{a.symbol}</span> - {a.name}
-                    {type === "sell" && (
-                      <span className="text-muted-foreground ml-2">({a.quantity} available)</span>
-                    )}
-                  </SelectItem>
-                ))}
+                {isBuy
+                  ? MARKET_ASSETS.map((a) => (
+                      <SelectItem key={a.symbol} value={a.symbol}>
+                        <span className="font-bold">{a.symbol}</span> — {a.name}
+                        <span className="text-muted-foreground ml-2">${a.price.toLocaleString()}</span>
+                      </SelectItem>
+                    ))
+                  : assets.map((a) => (
+                      <SelectItem key={a.id} value={a.symbol}>
+                        <span className="font-bold">{a.symbol}</span> — {a.name}
+                        <span className="text-muted-foreground ml-2">({a.quantity} available)</span>
+                      </SelectItem>
+                    ))}
               </SelectContent>
             </Select>
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="amount">Quantity</Label>
+            <Label>Quantity</Label>
             <Input
-              id="amount"
               type="number"
               step="any"
               min="0"
@@ -161,26 +175,22 @@ export function TradeModal({ open, onOpenChange, type, assets }: TradeModalProps
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="price">Price per unit ($)</Label>
+            <Label>Price per unit ($)</Label>
             <Input
-              id="price"
               type="text"
               className="cyber-input"
-              value={selectedAsset ? `${priceNum}` : ""}
-              placeholder={selectedAsset ? "" : "Select an asset to view price"}
+              value={asset ? `$${priceNum.toLocaleString()}` : ""}
+              placeholder="Select an asset to view price"
               disabled
               readOnly
             />
-            <p className="text-xs text-muted-foreground">
-              Market Price based on mock data
-            </p>
           </div>
 
           {showTotal && (
             <div className="p-3 rounded border border-border/50 bg-card/50">
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">Total</span>
-                <span className="font-bold text-foreground">${totalValue.toFixed(2)}</span>
+                <span className="font-bold text-foreground">${totalValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
             </div>
           )}
