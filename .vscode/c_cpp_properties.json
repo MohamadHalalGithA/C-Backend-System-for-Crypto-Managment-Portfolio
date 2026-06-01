@@ -1,0 +1,15 @@
+{
+    "configurations": [
+        {
+            "name": "Linux (open via Remote-WSL for full IntelliSense)",
+            "includePath": [
+                "${workspaceFolder}/backend/src"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
