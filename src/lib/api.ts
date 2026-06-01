@@ -10,7 +10,7 @@ import type {
   ApiResponse,
 } from "./types";
 
-const API_URL = "http://172.31.86.180:8080/api";
+const API_URL = "http://localhost:8080/api";
 
 class ApiClient {
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
