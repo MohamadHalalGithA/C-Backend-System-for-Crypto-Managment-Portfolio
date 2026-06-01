@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useEffect, ReactNode } from "react
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route, useNavigate, Link } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
@@ -30,6 +30,7 @@ function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserType | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [useLocalAuth, setUseLocalAuth] = useState(false);
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     // Try to restore session
@@ -41,12 +42,19 @@ function AuthProvider({ children }: { children: ReactNode }) {
         localStorage.removeItem("cyber_session");
       }
     }
-    // Check if we should use local auth (backend unavailable)
+    // Verify session with backend
     api.getMe().then(u => {
       setUser(u);
       localStorage.setItem("cyber_session", JSON.stringify(u));
-    }).catch(() => {
-      setUseLocalAuth(true);
+    }).catch((error) => {
+      if (error.message.includes("Backend unavailable")) {
+        // Backend is down — use localStorage fallback
+        setUseLocalAuth(true);
+      } else {
+        // 401: session expired or not logged in — clear stale local state
+        setUser(null);
+        localStorage.removeItem("cyber_session");
+      }
     }).finally(() => {
       setIsLoading(false);
     });
@@ -98,10 +106,12 @@ function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const logout = () => { 
-    setUser(null); 
+  const logout = () => {
+    setUser(null);
     localStorage.removeItem("cyber_session");
     api.logout();
+    // Clear all cached query data so the next user starts fresh
+    queryClient.clear();
   };
 
   return <AuthContext.Provider value={{ user, isAuthenticated: !!user, isLoading, login, signup, logout }}>{children}</AuthContext.Provider>;
