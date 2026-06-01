@@ -3,10 +3,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <ctype.h> 
+#include <ctype.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <sqlite3.h>
 
 #include "db.h"
 
@@ -32,34 +31,22 @@ static char *lower_dup(const char *s) {
     return o;
 }
 
-static const char *find_header_value(const char *req, const char *header_name) {
-    // Portable-ish: lowercase compare by building lowercase copies
+static int parse_content_length(const char *req) {
     char *req_l = lower_dup(req);
-    char *hn_l  = lower_dup(header_name);
-    if (!req_l || !hn_l) { free(req_l); free(hn_l); return NULL; }
-
-    char *p = strstr(req_l, hn_l);
-    if (!p) { free(req_l); free(hn_l); return NULL; }
-
-    // Map pointer back to original request
+    if (!req_l) return 0;
+    const char *p = strstr(req_l, "\ncontent-length:");
+    if (!p) { free(req_l); return 0; }
     const char *orig_p = req + (p - req_l);
-    free(req_l); free(hn_l);
-
+    free(req_l);
     orig_p = strchr(orig_p, ':');
-    if (!orig_p) return NULL;
+    if (!orig_p) return 0;
     orig_p++;
     while (*orig_p == ' ' || *orig_p == '\t') orig_p++;
-    return orig_p;
-}
-
-static int parse_content_length(const char *req) {
-    const char *cl = find_header_value(req, "content-length");
-    if (!cl) return 0;
-    return atoi(cl);
+    return atoi(orig_p);
 }
 
 static void send_preflight(int sock) {
-    char hdr[1024];
+    char hdr[512];
     snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 204 No Content\r\n"
         "Access-Control-Allow-Origin: %s\r\n"
@@ -89,6 +76,27 @@ static void send_json(int sock, int status, const char *status_text, const char 
     send_all(sock, json_body, strlen(json_body));
 }
 
+static void send_json_with_cookie(int sock, int status, const char *status_text,
+                                  const char *json_body, const char *cookie_line) {
+    if (!json_body) json_body = "";
+    if (!cookie_line) cookie_line = "";
+    char hdr[2048];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: %s\r\n"
+        "Access-Control-Allow-Credentials: true\r\n"
+        "%s"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        status, status_text, FRONTEND_ORIGIN,
+        cookie_line,
+        strlen(json_body)
+    );
+    send_all(sock, hdr, strlen(hdr));
+    send_all(sock, json_body, strlen(json_body));
+}
+
 static char *wrap_success_raw(const char *raw_json) {
     if (!raw_json) raw_json = "null";
     size_t n = strlen(raw_json) + 64;
@@ -107,7 +115,6 @@ static char *wrap_error_msg(const char *msg) {
     return out;
 }
 
-// SUPER tiny JSON field extraction
 static int json_get_string_field(const char *json, const char *key, char *out, size_t out_len) {
     char pat[128];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -141,6 +148,60 @@ static int json_get_number_field(const char *json, const char *key, double *out)
 
 static int path_is(const char *path, const char *a, const char *b) {
     return (strcmp(path, a) == 0) || (b && strcmp(path, b) == 0);
+}
+
+// Generate a 64-char hex token
+static void generate_token(char *out, size_t len) {
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len - 1; i++) out[i] = hex[rand() % 16];
+    out[len - 1] = '\0';
+}
+
+// Extract a named cookie value from the raw HTTP request
+static int get_cookie_value(const char *req, const char *cookie_name, char *out, size_t out_len) {
+    char *req_l = lower_dup(req);
+    if (!req_l) return 0;
+    // Search "\ncookie:" to avoid accidentally matching "set-cookie:"
+    const char *p = strstr(req_l, "\ncookie:");
+    if (!p) { free(req_l); return 0; }
+    const char *orig_p = req + (p - req_l);
+    free(req_l);
+    orig_p = strchr(orig_p, ':');
+    if (!orig_p) return 0;
+    orig_p++;
+    while (*orig_p == ' ' || *orig_p == '\t') orig_p++;
+
+    // Copy until end of header line
+    const char *end = strstr(orig_p, "\r\n");
+    size_t hdr_len = end ? (size_t)(end - orig_p) : strlen(orig_p);
+    char cookies[2048];
+    if (hdr_len >= sizeof(cookies)) hdr_len = sizeof(cookies) - 1;
+    strncpy(cookies, orig_p, hdr_len);
+    cookies[hdr_len] = '\0';
+
+    // Find "name=" in the cookie string
+    char pat[128];
+    snprintf(pat, sizeof(pat), "%s=", cookie_name);
+    const char *cp = strstr(cookies, pat);
+    if (!cp) return 0;
+    cp += strlen(pat);
+
+    const char *ce = strchr(cp, ';');
+    size_t vlen = ce ? (size_t)(ce - cp) : strlen(cp);
+    while (vlen > 0 && (cp[vlen-1] == ' ' || cp[vlen-1] == '\t')) vlen--;
+    if (vlen >= out_len) vlen = out_len - 1;
+    strncpy(out, cp, vlen);
+    out[vlen] = '\0';
+    return (vlen > 0) ? 1 : 0;
+}
+
+// Resolve session cookie to a user_id. Returns -1 if missing or invalid.
+static int get_user_id_from_request(const char *req) {
+    char token[128] = "";
+    if (!get_cookie_value(req, "session_token", token, sizeof(token))) return -1;
+    int user_id = -1;
+    if (db_get_user_id_from_session(token, &user_id) != 0) return -1;
+    return user_id;
 }
 
 // ---------- client thread ----------
@@ -188,6 +249,8 @@ void* handle_client(void *arg) {
     const char *body_json = (content_length > 0 && body_start < received) ? (buf + body_start) : NULL;
 
     // ---------- ROUTES ----------
+
+    // GET /api/health  (public)
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/health") == 0) {
         char *ok = wrap_success_raw("{\"status\":\"ok\"}");
         send_json(client_sock, 200, "OK", ok);
@@ -196,18 +259,137 @@ void* handle_client(void *arg) {
         return NULL;
     }
 
-    // GET /api/transactions (accept trailing slash too)
-    if (strcmp(method, "GET") == 0 && path_is(path, "/api/transactions", "/api/transactions/")) {
-        // For now: single-user demo mode (user_id=1).
-        // If you want real auth, we can wire cookies later.
-        int user_id = 1;
+    // POST /api/signup  (public)
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/signup") == 0) {
+        if (!body_json) {
+            char *err = wrap_error_msg("Request body required");
+            send_json(client_sock, 400, "Bad Request", err);
+            free(err); close(client_sock); return NULL;
+        }
+        char email[128] = "", password[128] = "", username[64] = "";
+        json_get_string_field(body_json, "email", email, sizeof(email));
+        json_get_string_field(body_json, "password", password, sizeof(password));
+        json_get_string_field(body_json, "username", username, sizeof(username));
+        for (size_t i = 0; email[i]; i++) email[i] = (char)tolower((unsigned char)email[i]);
+        if (email[0] == '\0' || password[0] == '\0' || username[0] == '\0') {
+            char *err = wrap_error_msg("email, password, username required");
+            send_json(client_sock, 400, "Bad Request", err);
+            free(err); close(client_sock); return NULL;
+        }
+        int user_id = -1;
+        if (db_create_user(email, password, username, &user_id) != 0) {
+            char *err = wrap_error_msg("User creation failed (email already exists?)");
+            send_json(client_sock, 400, "Bad Request", err);
+            free(err); close(client_sock); return NULL;
+        }
+        // Auto-login: create a session so the user is immediately authenticated
+        char token[65];
+        generate_token(token, sizeof(token));
+        db_create_session(user_id, token);
+        char cookie_line[256];
+        snprintf(cookie_line, sizeof(cookie_line),
+            "Set-Cookie: session_token=%s; Path=/; HttpOnly; SameSite=Lax\r\n", token);
 
+        char *user_json = db_get_user_json(user_id);
+        if (!user_json) user_json = strdup("{\"id\":-1,\"email\":\"\",\"username\":\"\"}");
+        char *ok = wrap_success_raw(user_json);
+        free(user_json);
+        send_json_with_cookie(client_sock, 201, "Created", ok, cookie_line);
+        free(ok);
+        close(client_sock);
+        return NULL;
+    }
+
+    // POST /api/login  (public)
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/login") == 0) {
+        if (!body_json) {
+            char *err = wrap_error_msg("Request body required");
+            send_json(client_sock, 400, "Bad Request", err);
+            free(err); close(client_sock); return NULL;
+        }
+        char email[128] = "", password[128] = "";
+        json_get_string_field(body_json, "email", email, sizeof(email));
+        json_get_string_field(body_json, "password", password, sizeof(password));
+        for (size_t i = 0; email[i]; i++) email[i] = (char)tolower((unsigned char)email[i]);
+        if (email[0] == '\0' || password[0] == '\0') {
+            char *err = wrap_error_msg("email and password required");
+            send_json(client_sock, 400, "Bad Request", err);
+            free(err); close(client_sock); return NULL;
+        }
+        int user_id = -1;
+        char username[64] = "";
+        if (db_check_user(email, password, &user_id, username, sizeof(username)) != 1) {
+            char *err = wrap_error_msg("Invalid credentials");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
+        char token[65];
+        generate_token(token, sizeof(token));
+        db_create_session(user_id, token);
+        char cookie_line[256];
+        snprintf(cookie_line, sizeof(cookie_line),
+            "Set-Cookie: session_token=%s; Path=/; HttpOnly; SameSite=Lax\r\n", token);
+
+        char user_json[256];
+        snprintf(user_json, sizeof(user_json),
+            "{\"id\":\"%d\",\"email\":\"%s\",\"username\":\"%s\"}", user_id, email, username);
+        char *ok = wrap_success_raw(user_json);
+        send_json_with_cookie(client_sock, 200, "OK", ok, cookie_line);
+        free(ok);
+        close(client_sock);
+        return NULL;
+    }
+
+    // POST /api/logout  (public — always succeeds)
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/logout") == 0) {
+        char token[128] = "";
+        get_cookie_value(buf, "session_token", token, sizeof(token));
+        if (token[0]) db_delete_session(token);
+        char *ok = wrap_success_raw("{\"message\":\"logged out\"}");
+        send_json_with_cookie(client_sock, 200, "OK", ok,
+            "Set-Cookie: session_token=; Path=/; HttpOnly; Max-Age=0\r\n");
+        free(ok);
+        close(client_sock);
+        return NULL;
+    }
+
+    // ---------- AUTHENTICATED ROUTES ----------
+    // All routes below require a valid session cookie.
+
+    // GET /api/me
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/me") == 0) {
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
+        char *user = db_get_user_json(user_id);
+        if (!user) {
+            char *err = wrap_error_msg("User not found");
+            send_json(client_sock, 404, "Not Found", err);
+            free(err); close(client_sock); return NULL;
+        }
+        char *ok = wrap_success_raw(user);
+        free(user);
+        send_json(client_sock, 200, "OK", ok);
+        free(ok);
+        close(client_sock);
+        return NULL;
+    }
+
+    // GET /api/transactions
+    if (strcmp(method, "GET") == 0 && path_is(path, "/api/transactions", "/api/transactions/")) {
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
         char *txs = db_get_transactions_json(user_id);
         if (!txs) txs = strdup("[]");
-
         char *ok = wrap_success_raw(txs);
         free(txs);
-
         send_json(client_sock, 200, "OK", ok);
         free(ok);
         close(client_sock);
@@ -219,18 +401,16 @@ void* handle_client(void *arg) {
         if (!body_json) {
             char *err = wrap_error_msg("Request body required");
             send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
-
-        int user_id = 1;
-
-        // payload example:
-        // {type:"buy", asset:"ETH", amount:2, price:2650, total:5300, status:"pending", timestamp:"2025-...Z"}
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
         char type[16] = "", asset[64] = "", status[32] = "pending", timestamp[64] = "";
         double amount = 0, price = 0, total = 0;
-
         json_get_string_field(body_json, "type", type, sizeof(type));
         json_get_string_field(body_json, "asset", asset, sizeof(asset));
         json_get_string_field(body_json, "status", status, sizeof(status));
@@ -238,52 +418,29 @@ void* handle_client(void *arg) {
         json_get_number_field(body_json, "amount", &amount);
         json_get_number_field(body_json, "price", &price);
         json_get_number_field(body_json, "total", &total);
-
         if (strcmp(type, "buy") != 0 && strcmp(type, "sell") != 0) {
             char *err = wrap_error_msg("type must be buy or sell");
             send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
         if (asset[0] == '\0' || amount <= 0) {
             char *err = wrap_error_msg("asset and positive amount required");
             send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
-        if (timestamp[0] == '\0') {
-            // fallback timestamp
+        if (timestamp[0] == '\0')
             snprintf(timestamp, sizeof(timestamp), "1970-01-01T00:00:00.000Z");
-        }
-
         int tx_id = -1;
         if (db_create_transaction(user_id, type, asset, amount, price, total, status, timestamp, &tx_id) != 0) {
             char *err = wrap_error_msg("Failed to create transaction (sell too much? asset missing?)");
             send_json(client_sock, 500, "Internal Server Error", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
-
         char *one = db_get_transaction_json(user_id, tx_id);
         if (!one) one = strdup("null");
-
         char *ok = wrap_success_raw(one);
         free(one);
-
         send_json(client_sock, 201, "Created", ok);
-        free(ok);
-        close(client_sock);
-        return NULL;
-    }
-
-    // GET /api/me
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/me") == 0) {
-        char *user = "{\"id\":\"1\",\"email\":\"demo@demo.com\",\"username\":\"demo\"}";
-        char *ok = wrap_success_raw(user);
-        send_json(client_sock, 200, "OK", ok);
         free(ok);
         close(client_sock);
         return NULL;
@@ -291,9 +448,14 @@ void* handle_client(void *arg) {
 
     // GET /api/assets
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/assets") == 0) {
-        int user_id = 1;
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
         char *assets = db_get_assets_json(user_id);
-        if (!assets) assets = "[]";
+        if (!assets) assets = strdup("[]");
         char *ok = wrap_success_raw(assets);
         free(assets);
         send_json(client_sock, 200, "OK", ok);
@@ -307,11 +469,14 @@ void* handle_client(void *arg) {
         if (!body_json) {
             char *err = wrap_error_msg("Request body required");
             send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
-        int user_id = 1;
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
         char symbol[64] = "", name[128] = "", category[64] = "Crypto";
         double quantity = 0, current_price = 0, avg_cost = 0;
         json_get_string_field(body_json, "symbol", symbol, sizeof(symbol));
@@ -323,20 +488,16 @@ void* handle_client(void *arg) {
         if (symbol[0] == '\0' || name[0] == '\0' || quantity <= 0) {
             char *err = wrap_error_msg("symbol, name, and positive quantity required");
             send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
         int asset_id = -1;
         if (db_create_asset(user_id, symbol, name, quantity, current_price, avg_cost, category, &asset_id) != 0) {
             char *err = wrap_error_msg("Failed to create asset");
             send_json(client_sock, 500, "Internal Server Error", err);
-            free(err);
-            close(client_sock);
-            return NULL;
+            free(err); close(client_sock); return NULL;
         }
         char *one = db_get_asset_json(user_id, asset_id);
-        if (!one) one = "null";
+        if (!one) one = strdup("null");
         char *ok = wrap_success_raw(one);
         free(one);
         send_json(client_sock, 201, "Created", ok);
@@ -347,9 +508,14 @@ void* handle_client(void *arg) {
 
     // GET /api/portfolio/chart
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/portfolio/chart") == 0) {
-        int user_id = 1;
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
         char *chart = db_get_chart_json(user_id);
-        if (!chart) chart = "[]";
+        if (!chart) chart = strdup("[]");
         char *ok = wrap_success_raw(chart);
         free(chart);
         send_json(client_sock, 200, "OK", ok);
@@ -360,9 +526,14 @@ void* handle_client(void *arg) {
 
     // GET /api/portfolio/allocation
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/portfolio/allocation") == 0) {
-        int user_id = 1;
+        int user_id = get_user_id_from_request(buf);
+        if (user_id < 0) {
+            char *err = wrap_error_msg("Unauthorized");
+            send_json(client_sock, 401, "Unauthorized", err);
+            free(err); close(client_sock); return NULL;
+        }
         char *alloc = db_get_allocation_json(user_id);
-        if (!alloc) alloc = "[]";
+        if (!alloc) alloc = strdup("[]");
         char *ok = wrap_success_raw(alloc);
         free(alloc);
         send_json(client_sock, 200, "OK", ok);
@@ -371,95 +542,7 @@ void* handle_client(void *arg) {
         return NULL;
     }
 
-    // POST /api/signup
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/signup") == 0) {
-        if (!body_json) {
-            char *err = wrap_error_msg("Request body required");
-            send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
-        }
-        char email[128] = "", password[128] = "", username[64] = "";
-        json_get_string_field(body_json, "email", email, sizeof(email));
-        json_get_string_field(body_json, "password", password, sizeof(password));
-        json_get_string_field(body_json, "username", username, sizeof(username));
-        // Make email case insensitive
-        for (size_t i = 0; email[i]; i++) email[i] = (char)tolower((unsigned char)email[i]);
-        if (email[0] == '\0' || password[0] == '\0' || username[0] == '\0') {
-            char *err = wrap_error_msg("email, password, username required");
-            send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
-        }
-        int user_id = -1;
-        if (db_create_user(email, password, username, &user_id) != 0) {
-            char *err = wrap_error_msg("User creation failed (email exists?)");
-            send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
-        }
-        char *user_json = db_get_user_json(user_id);
-        if (!user_json) user_json = "{\"id\":-1,\"email\":\"\",\"username\":\"\"}";
-        char *ok = wrap_success_raw(user_json);
-        free(user_json);
-        send_json(client_sock, 201, "Created", ok);
-        free(ok);
-        close(client_sock);
-        return NULL;
-    }
-
-    // POST /api/login
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/login") == 0) {
-        if (!body_json) {
-            char *err = wrap_error_msg("Request body required");
-            send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
-        }
-        char email[128] = "", password[128] = "";
-        json_get_string_field(body_json, "email", email, sizeof(email));
-        json_get_string_field(body_json, "password", password, sizeof(password));
-        // Make email case insensitive
-        for (size_t i = 0; email[i]; i++) email[i] = (char)tolower((unsigned char)email[i]);
-        if (email[0] == '\0' || password[0] == '\0') {
-            char *err = wrap_error_msg("email and password required");
-            send_json(client_sock, 400, "Bad Request", err);
-            free(err);
-            close(client_sock);
-            return NULL;
-        }
-        int user_id = -1;
-        char username[64] = "";
-        if (db_check_user(email, password, &user_id, username, sizeof(username)) == 0) {
-            char *err = wrap_error_msg("Invalid credentials");
-            send_json(client_sock, 401, "Unauthorized", err);
-            free(err);
-            close(client_sock);
-            return NULL;
-        }
-        char user_json[256];
-        snprintf(user_json, sizeof(user_json), "{\"id\":\"%d\",\"email\":\"%s\",\"username\":\"%s\"}", user_id, email, username);
-        char *ok = wrap_success_raw(user_json);
-        send_json(client_sock, 200, "OK", ok);
-        free(ok);
-        close(client_sock);
-        return NULL;
-    }
-
-    // POST /api/logout
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/logout") == 0) {
-        char *ok = wrap_success_raw("{\"message\":\"logged out\"}");
-        send_json(client_sock, 200, "OK", ok);
-        free(ok);
-        close(client_sock);
-        return NULL;
-    }
-
-    // fallback
+    // 404 fallback
     {
         char *err = wrap_error_msg("Not found");
         send_json(client_sock, 404, "Not Found", err);
